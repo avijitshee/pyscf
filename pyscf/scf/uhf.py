@@ -151,6 +151,35 @@ def make_rdm1(mo_coeff, mo_occ, **kwargs):
 # arrays and modifications to DM arrays may be ignored.
     return numpy.array((dm_a, dm_b))
 
+def make_rdm1_MO(mf, mo_energy, mu):
+    '''One-particle density matrix
+
+    gamma = 1/1+e^{beta (e-\mu)}
+
+    Returns:
+        A list of 2D ndarrays for alpha and beta spins
+    '''
+    nmo = mo_energy[0].size
+
+    dm_mo_a = numpy.zeros((nmo))
+    dm_mo_b = numpy.zeros((nmo))
+
+    for i in range(nmo):
+        factor = mf.beta*(mo_energy[:,i]-mu)
+        if (any(factor) >= 1.e-14):
+           dm_mo_a[i] = numpy.exp(-factor[0]) /(1.0 + numpy.exp(-factor[0]))
+           dm_mo_b[i] = numpy.exp(-factor[1]) /(1.0 + numpy.exp(-factor[1]))
+        else:
+           dm_mo_a[i] = 1.0/(1.0 + numpy.exp(factor[0]))
+           dm_mo_b[i] = 1.0/(1.0 + numpy.exp(factor[1]))
+
+# DO NOT make tag_array for DM here because the DM arrays may be modified and
+# passed to functions like get_jk, get_vxc.  These functions may take the tags
+# (mo_coeff, mo_occ) to compute the potential if tags were found in the DM
+# arrays and modifications to DM arrays may be ignored.
+    return numpy.array((dm_mo_a, dm_mo_b))
+
+
 def make_rdm2(mo_coeff, mo_occ):
     '''Two-particle density matrix in AO representation
 
@@ -275,6 +304,70 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1, diis=None,
         f = (hf.level_shift(s1e, dm[0], f[0], shifta),
              hf.level_shift(s1e, dm[1], f[1], shiftb))
     return numpy.array(f)
+
+def find_mu(mf, mo_energy=None, mu=0.0, tol=1e-12, print_debug=True):
+    if mo_energy is None: mo_energy = mf.mo_energy
+    n_a, n_b = mf.nelec
+    target_nelec = n_a + n_b
+    rho = make_rdm1_MO(mf, mo_energy, mu)
+    nel = sum(rho[0]).real + sum(rho[1]).real
+
+    ratio1 = 1 - 1. / (numpy.sqrt(5) / 2. + 0.5)
+    ratio2 = 1. / (numpy.sqrt(5) / 2. + 0.5)
+    mu_diff = 3.5
+    if nel > target_nelec:
+        mu1 = mu - mu_diff
+        mu2 = mu
+        ratio = ratio1
+        mu_mid = ratio*mu1 + (1-ratio)*mu2
+    elif nel < target_nelec:
+        mu1 = mu
+        mu2 = mu + mu_diff
+        ratio = ratio2
+        mu_mid = ratio*mu1 + (1-ratio)*mu2
+    else:
+        mu_mid = mu
+    res_mu = mu
+    while numpy.abs(nel - target_nelec) > tol:
+        if print_debug:
+            print(nel, mu1, mu2, mu_mid)
+        res_mu = mu_mid
+        old_nel = nel
+        rho = make_rdm1_MO(mf, mo_energy, mu_mid)
+        nel = sum(rho[0]).real + sum(rho[1]).real
+        ratio = ratio2 if numpy.abs(nel - target_nelec) > numpy.abs(old_nel - target_nelec) else ratio1
+        if nel > target_nelec:
+            mu2 = mu_mid
+        elif nel < target_nelec:
+            mu1 = mu_mid
+        mu_mid = ratio*mu1 + (1 - ratio)*mu2
+
+    return res_mu
+
+def make_rdm1_AO_FT (mf, mo_energy, mu, mo_coeff):
+
+#find optimal chemical potential:  
+#    mu = find_mu(mo_energy, mu)
+    norb = mo_energy[0].size
+#reconstruct RDM in MO basis: 
+    dm_mo_a, dm_mo_b = make_rdm1_MO(mf, mo_energy, mu)
+
+#transform RDM from MO basis to AO: 
+
+#   dm_a, dm_b =  transform_ao_to_mo(mo_coeff, dm_mo_a, dm_mo_b)
+
+#inflate from diagonal to full matrix (this operation should be replaced by a cheaper algorithm. as of now we are just testing..)   
+    dm_mo_a_full = numpy.zeros((norb,norb), dtype=mo_coeff[0].dtype)
+    dm_mo_b_full = numpy.zeros((norb,norb), dtype=mo_coeff[1].dtype)
+
+    for i in range(norb):
+        dm_mo_a_full [i,i] = dm_mo_a[i]
+        dm_mo_b_full [i,i] = dm_mo_b[i]
+
+    dm_a = reduce(numpy.dot, (mo_coeff[0], dm_mo_a_full, mo_coeff[0].T))
+    dm_b = reduce(numpy.dot, (mo_coeff[1], dm_mo_b_full, mo_coeff[1].T))
+
+    return numpy.array((dm_a, dm_b))
 
 def get_occ(mf, mo_energy=None, mo_coeff=None):
     if mo_energy is None: mo_energy = mf.mo_energy
@@ -807,6 +900,8 @@ class UHF(hf.SCF):
 
     get_occ = get_occ
 
+    find_mu = find_mu
+
     def get_grad(self, mo_coeff, mo_occ, fock=None):
         if fock is None:
             dm1 = self.make_rdm1(mo_coeff, mo_occ)
@@ -830,6 +925,13 @@ class UHF(hf.SCF):
         return make_rdm2(mo_coeff, mo_occ, **kwargs)
 
     energy_elec = energy_elec
+    make_rdm1_AO_FT = make_rdm1_AO_FT
+#   def make_rdm1_AO_FT (self, mo_energy=None, mu=0.0, mo_coeff=None):
+#       if mo_coeff is None:
+#           mo_coeff = self.mo_coeff
+#       if mo_energy is None:
+#           mo_energy = self.mo_energy
+#       return make_rdm1_AO_FT(self, mo_energy, mu, mo_coeff)
 
     def init_guess_by_minao(self, mol=None, breaksym=BREAKSYM):
         '''Initial guess in terms of the overlap to minimal basis.'''

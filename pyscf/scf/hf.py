@@ -161,6 +161,7 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         # Note in pbc.scf, mf.mol == mf.cell, cell is saved under key "mol"
         chkfile.save_mol(mol, mf.chkfile)
 
+
     # A preprocessing hook before the SCF iteration
     mf.pre_kernel(locals())
 
@@ -172,9 +173,25 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         fock = mf.get_fock(h1e, s1e, vhf, dm, cycle, mf_diis)
         mo_energy, mo_coeff = mf.eig(fock, s1e)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
-        dm = mf.make_rdm1(mo_coeff, mo_occ)
+          
+#ashee. assign initial guess for chemical potential here..
+        if cycle==0 :
+           if mo_energy.shape[0] == 2: 
+              homo = mol.nelec
+              mu = (1.0/2.0)*(mo_energy[0][homo[0]-1] + mo_energy[1][homo[1]-1])
+           else:
+              homo = mol.nelectron//2
+              mu = mo_energy[homo-1]   
+
+        if (mf.beta < 1e4):
+           mu_last = mu
+           mu = mf.find_mu(mo_energy, mu=mu_last) 
+           dm = mf.make_rdm1_AO_FT(mo_energy, mu, mo_coeff)
+        else: 
+           dm = mf.make_rdm1(mo_coeff, mo_occ)
+           dm = lib.tag_array(dm, mo_coeff=mo_coeff, mo_occ=mo_occ)
+
         # attach mo_coeff and mo_occ to dm to improve DFT get_veff efficiency
-        dm = lib.tag_array(dm, mo_coeff=mo_coeff, mo_occ=mo_occ)
         vhf = mf.get_veff(mol, dm, dm_last, vhf)
         e_tot = mf.energy_tot(dm, h1e, vhf)
 
@@ -210,8 +227,14 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         #fock = mf.get_fock(h1e, s1e, vhf, dm)  # = h1e + vhf
         mo_energy, mo_coeff = mf.eig(fock, s1e)
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
-        dm, dm_last = mf.make_rdm1(mo_coeff, mo_occ), dm
-        dm = lib.tag_array(dm, mo_coeff=mo_coeff, mo_occ=mo_occ)
+
+        if (mf.beta < 1e4):
+           mu_last = mu
+           mu = mf.find_mu(mo_energy, mu=mu_last) 
+           dm, dm_last = mf.make_rdm1_AO_FT(mo_energy, mu, mo_coeff), dm
+        else: 
+            dm, dm_last = mf.make_rdm1(mo_coeff, mo_occ), dm
+            dm = lib.tag_array(dm, mo_coeff=mo_coeff, mo_occ=mo_occ)
         vhf = mf.get_veff(mol, dm, dm_last, vhf)
         e_tot, last_hf_e = mf.energy_tot(dm, h1e, vhf), e_tot
 
@@ -1188,6 +1211,90 @@ def canonicalize(mf, mo_coeff, mo_occ, fock=None):
             mo_e[idx] = e
     return mo_e, mo
 
+def make_rdm1_MO(mf, mo_energy, mu):
+    '''One-particle density matrix
+
+    gamma = 1/1+e^{beta (e-\mu)}
+
+    Returns:
+    '''
+    nmo = mo_energy.size
+
+    dm_mo = numpy.zeros((nmo))
+
+    for i in range(nmo):
+        factor = mf.beta*(mo_energy[i]-mu)
+        if (factor >= 1.e-14):
+           dm_mo[i] = numpy.exp(-factor) /(1.0 + numpy.exp(-factor))
+        else:
+           dm_mo[i] = 1.0/(1.0 + numpy.exp(factor))
+
+# DO NOT make tag_array for DM here because the DM arrays may be modified and
+# passed to functions like get_jk, get_vxc.  These functions may take the tags
+# (mo_coeff, mo_occ) to compute the potential if tags were found in the DM
+# arrays and modifications to DM arrays may be ignored.
+    return numpy.array(dm_mo)
+
+def find_mu(mf, mo_energy=None, mu=0.0, tol=1e-9, print_debug=False):
+    if mo_energy is None: mo_energy = mf.mo_energy
+    target_nelec = mf.mol.nelectron
+    rho = make_rdm1_MO(mf, mo_energy, mu)
+    nel = sum(rho).real 
+
+    ratio1 = 1 - 1. / (numpy.sqrt(5) / 2. + 0.5)
+    ratio2 = 1. / (numpy.sqrt(5) / 2. + 0.5)
+    mu_diff = 3.5
+    if nel > target_nelec:
+        mu1 = mu - mu_diff
+        mu2 = mu
+        ratio = ratio1
+        mu_mid = ratio*mu1 + (1-ratio)*mu2
+    elif nel < target_nelec:
+        mu1 = mu
+        mu2 = mu + mu_diff
+        ratio = ratio2
+        mu_mid = ratio*mu1 + (1-ratio)*mu2
+    else:
+        mu_mid = mu
+    res_mu = mu
+    while numpy.abs(nel - target_nelec) > tol:
+        if print_debug:
+            print(nel, mu1, mu2, mu_mid)
+        res_mu = mu_mid
+        old_nel = nel
+        rho = make_rdm1_MO(mf, mo_energy, mu_mid)
+        nel = sum(rho).real 
+        ratio = ratio2 if numpy.abs(nel - target_nelec) > numpy.abs(old_nel - target_nelec) else ratio1
+        if nel > target_nelec:
+            mu2 = mu_mid
+        elif nel < target_nelec:
+            mu1 = mu_mid
+        mu_mid = ratio*mu1 + (1 - ratio)*mu2
+
+    return res_mu
+
+def make_rdm1_AO_FT (mf, mo_energy, mu, mo_coeff):
+
+#find optimal chemical potential:  
+#    mu = find_mu(mo_energy, mu)
+    norb = mo_energy.size
+#reconstruct RDM in MO basis: 
+    dm_mo = make_rdm1_MO(mf, mo_energy, mu)
+
+#transform RDM from MO basis to AO: 
+
+#   dm_a, dm_b =  transform_ao_to_mo(mo_coeff, dm_mo_a, dm_mo_b)
+
+#inflate from diagonal to full matrix (this operation should be replaced by a cheaper algorithm. as of now we are just testing..)   
+    dm_mo_full = numpy.zeros((norb,norb),dtype=mo_coeff.dtype)
+
+    for i in range(norb):
+        dm_mo_full [i,i] = dm_mo[i]
+
+    dm = reduce(numpy.dot, (mo_coeff, dm_mo_full, mo_coeff.T))
+
+    return numpy.array(dm)
+
 def dip_moment(mol, dm, unit='Debye', verbose=logger.NOTE, **kwargs):
     r''' Dipole moment calculation
 
@@ -1426,6 +1533,7 @@ class SCF(lib.StreamObject):
     conv_tol_grad = getattr(__config__, 'scf_hf_SCF_conv_tol_grad', None)
     max_cycle = getattr(__config__, 'scf_hf_SCF_max_cycle', 50)
     init_guess = getattr(__config__, 'scf_hf_SCF_init_guess', 'minao')
+    beta = getattr(__config__, 'scf_hf_SCF_beta', 100000) #defining beta to a very high value
 
     # To avoid diis pollution form previous run, self.diis should not be
     # initialized as DIIS instance here
@@ -1479,7 +1587,7 @@ class SCF(lib.StreamObject):
         keys = set(('conv_tol', 'conv_tol_grad', 'max_cycle', 'init_guess',
                     'DIIS', 'diis', 'diis_space', 'diis_start_cycle',
                     'diis_file', 'diis_space_rollback', 'damp', 'level_shift',
-                    'direct_scf', 'direct_scf_tol', 'conv_check'))
+                    'direct_scf', 'direct_scf_tol', 'conv_check', 'beta'))
         self._keys = set(self.__dict__.keys()).union(keys)
 
     def build(self, mol=None):
@@ -1512,6 +1620,7 @@ class SCF(lib.StreamObject):
         log.info('SCF conv_tol = %g', self.conv_tol)
         log.info('SCF conv_tol_grad = %s', self.conv_tol_grad)
         log.info('SCF max_cycles = %d', self.max_cycle)
+        log.info('SCF beta = %d', self.beta)
         log.info('direct_scf = %s', self.direct_scf)
         if self.direct_scf:
             log.info('direct_scf_tol = %g', self.direct_scf_tol)
@@ -1543,6 +1652,9 @@ class SCF(lib.StreamObject):
 
     get_fock = get_fock
     get_occ = get_occ
+
+    find_mu = find_mu
+    make_rdm1_AO_FT = make_rdm1_AO_FT
 
     @lib.with_doc(get_grad.__doc__)
     def get_grad(self, mo_coeff, mo_occ, fock=None):
