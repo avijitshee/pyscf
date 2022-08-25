@@ -172,6 +172,91 @@ def get_occ(mf, mo_energy=None, mo_coeff=None):
         logger.debug(mf, 'multiplicity <S^2> = %.8g  2S+1 = %.8g', ss, s)
     return mo_occ
 
+
+def make_rdm1_MO(mf, mo_energy, mu):
+    '''One-particle density matrix
+
+    gamma = 1/1+e^{beta (e-\mu)}
+
+    Returns:
+    '''
+    nmo = mo_energy.size
+
+    dm_mo = numpy.zeros((nmo))
+
+    for i in range(nmo):
+        factor = mf.beta*(mo_energy[i]-mu)
+        if (factor >= 1.e-14):
+           dm_mo[i] = numpy.exp(-factor) /(1.0 + numpy.exp(-factor))
+        else:
+           dm_mo[i] = 1.0/(1.0 + numpy.exp(factor))
+
+# DO NOT make tag_array for DM here because the DM arrays may be modified and
+# passed to functions like get_jk, get_vxc.  These functions may take the tags
+# (mo_coeff, mo_occ) to compute the potential if tags were found in the DM
+# arrays and modifications to DM arrays may be ignored.
+    return numpy.array(dm_mo)
+
+def find_mu(mf, mo_energy=None, mu=0.0, tol=1e-9, print_debug=False):
+    if mo_energy is None: mo_energy = mf.mo_energy
+    target_nelec = mf.mol.nelectron
+    rho = make_rdm1_MO(mf, mo_energy, mu)
+    nel = sum(rho).real 
+
+    ratio1 = 1 - 1. / (numpy.sqrt(5) / 2. + 0.5)
+    ratio2 = 1. / (numpy.sqrt(5) / 2. + 0.5)
+    mu_diff = 3.5
+    if nel > target_nelec:
+        mu1 = mu - mu_diff
+        mu2 = mu
+        ratio = ratio1
+        mu_mid = ratio*mu1 + (1-ratio)*mu2
+    elif nel < target_nelec:
+        mu1 = mu
+        mu2 = mu + mu_diff
+        ratio = ratio2
+        mu_mid = ratio*mu1 + (1-ratio)*mu2
+    else:
+        mu_mid = mu
+    res_mu = mu
+    while numpy.abs(nel - target_nelec) > tol:
+        if print_debug:
+            print(nel, mu1, mu2, mu_mid)
+        res_mu = mu_mid
+        old_nel = nel
+        rho = make_rdm1_MO(mf, mo_energy, mu_mid)
+        nel = sum(rho).real 
+        ratio = ratio2 if numpy.abs(nel - target_nelec) > numpy.abs(old_nel - target_nelec) else ratio1
+        if nel > target_nelec:
+            mu2 = mu_mid
+        elif nel < target_nelec:
+            mu1 = mu_mid
+        mu_mid = ratio*mu1 + (1 - ratio)*mu2
+
+    return res_mu
+
+def make_rdm1_AO_FT (mf, mo_energy, mu, mo_coeff):
+
+#find optimal chemical potential:  
+#    mu = find_mu(mo_energy, mu)
+    norb = mo_energy.size
+#reconstruct RDM in MO basis: 
+    dm_mo = make_rdm1_MO(mf, mo_energy, mu)
+
+#transform RDM from MO basis to AO: 
+
+#   dm_a, dm_b =  transform_ao_to_mo(mo_coeff, dm_mo_a, dm_mo_b)
+
+#inflate from diagonal to full matrix (this operation should be replaced by a cheaper algorithm. as of now we are just testing..)   
+    dm_mo_full = numpy.zeros((norb,norb),dtype=mo_coeff.dtype)
+
+    for i in range(norb):
+        dm_mo_full [i,i] = dm_mo[i]
+
+    dm = reduce(numpy.dot, (mo_coeff, dm_mo_full, mo_coeff.T))
+
+    return numpy.array(dm)
+
 # mo_a and mo_b are occupied orbitals
 def spin_square(mo, s=1):
     r'''Spin of the GHF wavefunction
@@ -405,6 +490,9 @@ class GHF(hf.SCF):
         return scipy.linalg.block_diag(s, s)
 
     get_occ = get_occ
+
+    find_mu = find_mu
+    make_rdm1_AO_FT = make_rdm1_AO_FT
 
     def get_grad(self, mo_coeff, mo_occ, fock=None):
         if fock is None:

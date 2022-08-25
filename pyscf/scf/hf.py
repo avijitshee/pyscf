@@ -1233,7 +1233,7 @@ def make_rdm1_MO(mf, mo_energy, mu):
 # passed to functions like get_jk, get_vxc.  These functions may take the tags
 # (mo_coeff, mo_occ) to compute the potential if tags were found in the DM
 # arrays and modifications to DM arrays may be ignored.
-    return numpy.array(dm_mo)
+    return numpy.array(2.0*dm_mo)
 
 def find_mu(mf, mo_energy=None, mu=0.0, tol=1e-9, print_debug=False):
     if mo_energy is None: mo_energy = mf.mo_energy
