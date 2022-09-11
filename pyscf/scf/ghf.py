@@ -23,6 +23,7 @@ Non-relativistic generalized Hartree-Fock
 from functools import reduce
 import numpy
 import scipy.linalg
+import scipy.optimize
 from pyscf import lib
 from pyscf import gto
 from pyscf.lib import logger
@@ -235,17 +236,30 @@ def find_mu(mf, mo_energy=None, mu=0.0, tol=1e-9, print_debug=False):
 
     return res_mu
 
+def loss_function(mu, mf, mo_energy):
+
+    target_nelec = mf.mol.nelectron
+    dm_mo = make_rdm1_MO(mf, mo_energy, mu[0])  
+    y = target_nelec - sum(dm_mo).real 
+    return y
+
+def find_mu_lsquare(mf, mo_energy=None, mu=0.0, tol=1e-12):
+   
+    result = scipy.optimize.least_squares(loss_function, numpy.array(mu), jac='3-point', loss='soft_l1', f_scale=1.0, ftol=tol, xtol=1e-10, args=(mf, mo_energy))   
+
+    mu_new = result.x
+
+    return mu_new[0]
+
 def make_rdm1_AO_FT (mf, mo_energy, mu, mo_coeff):
 
 #find optimal chemical potential:  
-#    mu = find_mu(mo_energy, mu)
+#   mu = find_mu(mo_energy, mu)
     norb = mo_energy.size
 #reconstruct RDM in MO basis: 
     dm_mo = make_rdm1_MO(mf, mo_energy, mu)
 
 #transform RDM from MO basis to AO: 
-
-#   dm_a, dm_b =  transform_ao_to_mo(mo_coeff, dm_mo_a, dm_mo_b)
 
 #inflate from diagonal to full matrix (this operation should be replaced by a cheaper algorithm. as of now we are just testing..)   
     dm_mo_full = numpy.zeros((norb,norb),dtype=mo_coeff.dtype)
@@ -253,7 +267,7 @@ def make_rdm1_AO_FT (mf, mo_energy, mu, mo_coeff):
     for i in range(norb):
         dm_mo_full [i,i] = dm_mo[i]
 
-    dm = reduce(numpy.dot, (mo_coeff, dm_mo_full, mo_coeff.T))
+    dm = reduce(numpy.dot, (mo_coeff, dm_mo_full, mo_coeff.conj().T))
 
     return numpy.array(dm)
 
@@ -492,6 +506,7 @@ class GHF(hf.SCF):
     get_occ = get_occ
 
     find_mu = find_mu
+    find_mu_lsquare = find_mu_lsquare
     make_rdm1_AO_FT = make_rdm1_AO_FT
 
     def get_grad(self, mo_coeff, mo_occ, fock=None):
@@ -541,12 +556,12 @@ class GHF(hf.SCF):
             else:
                 return hf.SCF.get_jk(self, mol, dm, hermi, with_j, with_k, omega)
 
-#       vj, vk = jkbuild(mol, dm, hermi, with_j, with_k, omega)
+        vj, vk = jkbuild(mol, dm, hermi, with_j, with_k, omega)
 # ashee this section is questionable..
-        if nao == dm.shape[-1]:
-            vj, vk = jkbuild(mol, dm, hermi, with_j, with_k, omega)
-        else:  # GHF density matrix, shape (2N,2N)
-            vj, vk = get_jk(mol, dm, hermi, with_j, with_k, jkbuild, omega)
+#       if nao == dm.shape[-1]:
+#           vj, vk = jkbuild(mol, dm, hermi, with_j, with_k, omega)
+#       else:  # GHF density matrix, shape (2N,2N)
+#           vj, vk = get_jk(mol, dm, hermi, with_j, with_k, jkbuild, omega)
         return vj, vk
 
     def get_veff(self, mol=None, dm=None, dm_last=0, vhf_last=0, hermi=1):

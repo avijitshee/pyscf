@@ -180,12 +180,13 @@ Keyword argument "init_dm" is replaced by "dm0"''')
               homo = mol.nelec
               mu = (1.0/2.0)*(mo_energy[0][homo[0]-1] + mo_energy[1][homo[1]-1])
            else:
-              homo = mol.nelectron//2
+              homo = mol.nelectron
               mu = mo_energy[homo-1]   
 
         if (mf.beta < 1e4):
            mu_last = mu
-           mu = mf.find_mu(mo_energy, mu=mu_last) 
+#          mu = mf.find_mu(mo_energy, mu=mu_last) 
+           mu = mf.find_mu_lsquare(mo_energy, mu=mu_last) 
            dm = mf.make_rdm1_AO_FT(mo_energy, mu, mo_coeff)
         else: 
            dm = mf.make_rdm1(mo_coeff, mo_occ)
@@ -205,6 +206,7 @@ Keyword argument "init_dm" is replaced by "dm0"''')
         norm_ddm = numpy.linalg.norm(dm-dm_last)
         logger.info(mf, 'cycle= %d E= %.15g  delta_E= %4.3g  |g|= %4.3g  |ddm|= %4.3g',
                     cycle+1, e_tot, e_tot-last_hf_e, norm_gorb, norm_ddm)
+        print("chemical potential :", mu)
 
         if callable(mf.check_convergence):
             scf_conv = mf.check_convergence(locals())
