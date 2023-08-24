@@ -34,6 +34,11 @@ direct_nosym        No            No             No**               Yes
 from pyscf.fci import cistring
 from pyscf.fci import direct_spin0
 from pyscf.fci import direct_spin1
+from pyscf.fci import direct_tdsolver
+from pyscf.fci import direct_tddrive
+from pyscf.fci import direct_dip_corr
+from pyscf.fci import direct_dip_corr_refresh
+from pyscf.fci import direct_free_propagate
 from pyscf.fci import direct_uhf
 from pyscf.fci import direct_spin0_symm
 from pyscf.fci import direct_spin1_symm
