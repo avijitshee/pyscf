@@ -793,9 +793,14 @@ def kernel_lanczos(fci, h1e, eri, norb, nelec, ci0=None, link_index=None,
     for i in range(3):
        perm_dipole = numpy.dot(c,mu_0[i])
        print("perm dipole", perm_dipole) 
-       if abs(perm_dipole) < 1e-8:
+#       if abs(perm_dipole) < 1e-8:
+#          print("skip loop", i)
+#          continue
+
+       if i < 2:
           print("skip loop", i)
           continue
+
 
        with lib.with_omp_threads(fci.threads):
             A, alpha, beta = lib.lanczos_tridiagonalize(aop=hop, x0=mu_0[i], tol=tol, lindep=lindep,
@@ -840,6 +845,11 @@ def kernel_lanczos(fci, h1e, eri, norb, nelec, ci0=None, link_index=None,
 
        grid.append(t)
        Amu0 = numpy.einsum('ij,j->i', A, mu_0[i])   
+
+       Amu0=numpy.zeros((len_tdiag),complex)
+       for k in range(len_tdiag):
+           A_tmp = numpy.asarray(A[k]) 
+           Amu0[k] = numpy.dot(A_tmp, mu_0[i])
   
        list_left.append(Amu0)
        list_htdiag.append(Ht)
@@ -852,7 +862,13 @@ def kernel_lanczos(fci, h1e, eri, norb, nelec, ci0=None, link_index=None,
 
        while (t < maxtime):
           d_next = numpy.einsum('ji,i->j', U, d) 
-          fcivec = numpy.einsum('ij,j->i', A.transpose(), d_next)   
+#         fcivec = numpy.einsum('ij,j->i', A.transpose(), d_next)   
+
+          fcivec=numpy.zeros((c.shape),complex)
+          for k in range(len_tdiag):
+              A_tmp = numpy.asarray(A[k]) 
+              fcivec += A_tmp*d_next[k]
+
 
           print("check norm of the vector: ", numpy.linalg.norm(fcivec))
 
@@ -886,6 +902,11 @@ def kernel_lanczos(fci, h1e, eri, norb, nelec, ci0=None, link_index=None,
 
           Amu0 = numpy.einsum('ij,j->i', A, mu_0[i])   
 
+          Amu0=numpy.zeros((len_tdiag),complex)
+          for k in range(len_tdiag):
+              A_tmp = numpy.asarray(A[k]) 
+              Amu0[k] = numpy.dot(A_tmp, mu_0[i])
+
           list_left.append(Amu0)
           list_htdiag.append(Ht)
 #         dipole_corr.append(numpy.dot(mu_0[i], fcivec)*numpy.exp(1j*e*t)) 
@@ -894,11 +915,14 @@ def kernel_lanczos(fci, h1e, eri, norb, nelec, ci0=None, link_index=None,
           grid.append(t)
           print("current time, maxtime: ", t, maxtime)
 
-       print("total number of refresh: ", refresh)  
-       print("print dipole")
-       print(dipole_corr)
+       numpy.save("dip_"+str(i)+".npy", numpy.array(list_left))
+       numpy.save("Ht_"+str(i)+".npy", numpy.array(list_htdiag))
+       numpy.savetxt("lan_nodes_"+str(i)+".txt", numpy.array(grid))
 
-    return e, numpy.array(grid), numpy.array(dipole_corr), list_htdiag, list_left
+       print("total number of refresh: ", refresh)  
+       print("FCI energy ", e)
+
+    return e, numpy.array(grid), numpy.array(dipole_corr)
 
 def make_pspace_precond(hdiag, pspaceig, pspaceci, addr, level_shift=0):
     # precondition with pspace Hamiltonian, CPL, 169, 463

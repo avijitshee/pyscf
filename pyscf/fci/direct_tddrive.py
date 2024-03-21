@@ -828,8 +828,9 @@ def kernel_lanczos(fci, h1e_drive, extra_arg_drive, grid_drive, eri, norb, nelec
  
     for count, t in enumerate(grid):
         if count == 0:
-           d = numpy.einsum('ji,i->j', A, c)  #this operation is expensive. but an out-of-core implementation is possible perhaps.
-#           d[0] = 1.0 + 1j*0.0  
+           d = numpy.zeros((len_tdiag), complex)
+#          d = numpy.einsum('ji,i->j', A, c)  #this operation is expensive. but an out-of-core implementation is possible perhaps.
+           d[0] = 1.0 + 1j*0.0  
         else:
            print("we are at a time grid point which matches with the pulse grid: ", t)
 
@@ -856,7 +857,7 @@ def kernel_lanczos(fci, h1e_drive, extra_arg_drive, grid_drive, eri, norb, nelec
 
            w, T = scipy.linalg.eigh(Ht) 
 
-           tmax_new = time_limit(T.real, w.real, 1.e-4, len_tdiag)
+           tmax_new = time_limit(T.real, w.real, 1.e-6, len_tdiag)
            print("time interval", tmax_new) 
            print("norm of d_next", numpy.linalg.norm(d_next)) 
 
@@ -864,7 +865,14 @@ def kernel_lanczos(fci, h1e_drive, extra_arg_drive, grid_drive, eri, norb, nelec
         d_next =  numpy.einsum('ji,i->j', U, d) 
 
    #expand d[t] back to the original CI basis:
-        fcivec = numpy.einsum('ij,j->i', A.transpose(), d_next) #this is again a very expensive operation. storage is also problematic  
+##        fcivec = numpy.einsum('ij,j->i', A.transpose(), d_next) #this is again a very expensive operation. storage is also problematic  
+
+# previous operation has to be done with a loop:
+        fcivec=numpy.zeros((c.shape),complex)
+        for k in range(len_tdiag):
+           A_tmp = numpy.asarray(A[k]) 
+           fcivec += A_tmp*d_next[k]
+
 
         print("check norm of the vector: ", numpy.linalg.norm(fcivec))
         tot_energy  = energy(h1e, eri, fcivec.real, norb, nelec, link_index)

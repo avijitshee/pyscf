@@ -728,15 +728,16 @@ def lanczos_tridiagonalize(aop, x0, tol=1e-5, max_cycle=50, max_space=12,
 # repeat the orthogonalization process at least twice..
 
         if orthogonalize:
-           for k in range(2): 
+
+           for k in range(1): 
                for i in range(cycle):
-                   olap = dot(x1, xs[i].conj().transpose())
+                   xs_tmp = numpy.asarray(xs[i])
+                   olap = dot(x1, xs_tmp.conj().transpose())
                    if abs(olap) > lindep: 
-                      x1 -= olap*xs[i]
+                      x1 -= olap*xs_tmp
                    else:
                       continue
            norm = abs(dot(x1, x1.conj().transpose()))
-#           norm = abs(numpy.linalg.norm(x1.conj()))
            x1 *= 1/numpy.sqrt(norm)
         else:
            norm = abs(dot(x1, x1.conj().transpose()))
@@ -747,7 +748,9 @@ def lanczos_tridiagonalize(aop, x0, tol=1e-5, max_cycle=50, max_space=12,
         if abs(beta[cycle-1]) < tol and cycle > 1 :
             break
 
-    return numpy.array(xs), numpy.array(alpha), numpy.array(beta)
+#    return numpy.array(xs), numpy.array(alpha), numpy.array(beta)
+    return xs, numpy.array(alpha), numpy.array(beta)
+
 
 def make_diag_precond(diag, level_shift=0):
     '''Generate the preconditioner function with the diagonal function.'''
@@ -1649,7 +1652,8 @@ def cho_solve(a, b, strict_sym_pos=True):
             on matrix a
     '''
     try:
-        return scipy.linalg.solve(a, b, sym_pos=True)
+#        return scipy.linalg.solve(a, b, sym_pos=True)
+        return scipy.linalg.solve(a, b, strict_sym_pos)
     except numpy.linalg.LinAlgError:
         if strict_sym_pos:
             raise
