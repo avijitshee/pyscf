@@ -325,7 +325,7 @@ def make_rdm1s_complex(fcivec, norb, nelec, link_index=None):
                                 norb, nelec, link_index) 
  
     rdm1b = rdm.make_rdm1_spin1('FCImake_rdm1b', fcivec.real, fcivec.real,
-                                norb, nelec, link_index) + rdm.make_rdm1_spin1('FCImake_rdm1a', fcivec.imag, fcivec.imag,
+                                norb, nelec, link_index) + rdm.make_rdm1_spin1('FCImake_rdm1b', fcivec.imag, fcivec.imag,
                                 norb, nelec, link_index) 
     return rdm1a, rdm1b
 
@@ -367,6 +367,58 @@ def make_rdm12s(fcivec, norb, nelec, link_index=None, reorder=True):
         dm1a, dm2aa = rdm.reorder_rdm(dm1a, dm2aa, inplace=True)
         dm1b, dm2bb = rdm.reorder_rdm(dm1b, dm2bb, inplace=True)
     return (dm1a, dm1b), (dm2aa, dm2ab, dm2bb)
+
+def make_rdm12s_complex(fcivec, norb, nelec, link_index=None, reorder=True):
+    r'''Spin separated 1- and 2-particle density matrices.
+    The return values include two lists, a list of 1-particle density matrices
+    and a list of 2-particle density matrices.  The density matrices are:
+    (alpha,alpha), (beta,beta) for 1-particle density matrices;
+    (alpha,alpha,alpha,alpha), (alpha,alpha,beta,beta),
+    (beta,beta,beta,beta) for 2-particle density matrices.
+
+    1pdm[p,q] = :math:`\langle q^\dagger p\rangle`;
+    2pdm[p,q,r,s] = :math:`\langle p^\dagger r^\dagger s q\rangle`.
+
+    Energy should be computed as
+    E = einsum('pq,qp', h1, 1pdm) + 1/2 * einsum('pqrs,pqrs', eri, 2pdm)
+    where h1[p,q] = <p|h|q> and eri[p,q,r,s] = (pq|rs)
+    '''
+
+
+    dm1a_re, dm2aa_re = rdm.make_rdm12_spin1('FCIrdm12kern_a', fcivec.real, fcivec.real,
+                                norb, nelec, link_index, 1) 
+
+    dm1a_im, dm2aa_im = rdm.make_rdm12_spin1('FCIrdm12kern_a', fcivec.imag, fcivec.imag,
+                                norb, nelec, link_index, 1) 
+
+
+
+    dm1b_re, dm2bb_re = rdm.make_rdm12_spin1('FCIrdm12kern_b', fcivec.real, fcivec.real,
+                               norb, nelec, link_index, 1) 
+
+    dm1b_im, dm2bb_im = rdm.make_rdm12_spin1('FCIrdm12kern_b', fcivec.imag, fcivec.imag,
+                                norb, nelec, link_index, 1) 
+
+
+    _, dm2ab_re = rdm.make_rdm12_spin1('FCItdm12kern_ab', fcivec.real, fcivec.real,
+                               norb, nelec, link_index, 0) 
+
+    _, dm2ab_im = rdm.make_rdm12_spin1('FCItdm12kern_ab', fcivec.imag, fcivec.imag,
+                                norb, nelec, link_index, 0) 
+
+
+    dm1a = dm1a_re + dm1a_im
+    dm1b = dm1b_re + dm1b_im
+
+    dm2aa = dm2aa_re + dm2aa_im
+    dm2bb = dm2bb_re + dm2bb_im
+    dm2ab = dm2ab_re + dm2ab_im
+
+    if reorder:
+        dm1a, dm2aa = rdm.reorder_rdm(dm1a, dm2aa, inplace=True)
+        dm1b, dm2bb = rdm.reorder_rdm(dm1b, dm2bb, inplace=True)
+    return (dm1a, dm1b), (dm2aa, dm2ab, dm2bb)
+
 
 def make_rdm12(fcivec, norb, nelec, link_index=None, reorder=True):
     r'''Spin traced 1- and 2-particle density matrices.
@@ -823,7 +875,8 @@ def kernel_lanczos(fci, h1e_drive, extra_arg_drive, grid_drive, eri, norb, nelec
 
     grid = numpy.arange(mintime, maxtime, stepsize) 
 
-    density = numpy.zeros((len(grid),2,norb,norb))
+    density_1b = numpy.zeros((len(grid),2,norb,norb))
+    density_2b = numpy.zeros((len(grid),3,norb,norb,norb,norb))
 #    d = numpy.zeros((len(grid),len_tdiag), complex)
  
     for count, t in enumerate(grid):
@@ -880,13 +933,24 @@ def kernel_lanczos(fci, h1e_drive, extra_arg_drive, grid_drive, eri, norb, nelec
 
         print("Total Energy", tot_energy)
     
-        densa, densb = make_rdm1s_complex(fcivec, norb, nelec, link_index)
+#        densa, densb = make_rdm1s_complex(fcivec, norb, nelec, link_index)
 
-        density[count,0,:,:] = densa #+ densb
-        density[count,1,:,:] = densb #+ densb
+
+        (densa, densb), (den2aa, den2bb, den2ab)  = make_rdm12s_complex(fcivec, norb, nelec, link_index)
+
+        density_1b[count,0,:,:] = densa #+ densb
+        density_1b[count,1,:,:] = densb #+ densb
+
+
+        density_2b[count,0,:,:,:,:] = den2aa #+ densb
+        density_2b[count,1,:,:,:,:] = den2bb #+ densb
+        density_2b[count,2,:,:,:,:] = den2ab #+ densb
+
+    numpy.savetxt("density_1b.npy", density_1b.flatten())
+    numpy.savetxt("density_2b.npy", density_2b.flatten())
 
 #       print(numpy.trace(density[count]))
-    return min(w), density
+    return min(w), density_1b, density_2b
 
 def make_pspace_precond(hdiag, pspaceig, pspaceci, addr, level_shift=0):
     # precondition with pspace Hamiltonian, CPL, 169, 463
@@ -1106,11 +1170,11 @@ class FCIBase(lib.StreamObject):
             self.check_sanity()
         self.norb = norb
         self.nelec = nelec
-        self.eci, density = \
+        self.eci, density_1b, density_2b = \
                 kernel_lanczos(self, h1e_drive, extra_arg_drive, grid_drive, eri, norb, nelec, ci0, None,
                            tol, lindep, max_cycle, max_space, nroots,
                            davidson_only, pspace_size=pspace_size, mintime=mintime, maxtime=maxtime, stepsize=stepsize, ecore=ecore, **kwargs)
-        return self.eci, density
+        return self.eci, density_1b, density_2b
 
     @lib.with_doc(energy.__doc__)
     def energy(self, h1e, eri, fcivec, norb, nelec, link_index=None):
