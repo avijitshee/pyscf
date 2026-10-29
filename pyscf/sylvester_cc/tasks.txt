@@ -1,0 +1,9 @@
+I will modify the function dfrpa_triples.py. the steps are following:
+
+1) add mo_coeff to all the functions in __init__.py. it should be initialized to None. Modify df_eri call accordingly 
+2) add dfrpa_triples.py __init__.py
+3) in line number 222-224 in dfrpa_triples.py we have evaluated one of the ladder diagrams. I want to implement an approximate version of it, where the current implementation will work as a reference.
+4) for the new implementation I will use only diagonal part of Joo (that is m=j) and Jvv (b=e) to construct this term. because of this modification the scaling would become occ^2 vir^2.
+5) estimate the error w.r.t. the original implementation by testing it with this input file: ~/pyscf_mpcc_factorized/examples/sylvester_cc/01-dfrpa.py 
+6) use the pyscf path: ~/pyscf_mpcc_factorized
+
