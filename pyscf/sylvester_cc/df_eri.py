@@ -1,12 +1,29 @@
 import numpy as np
 from pyscf import lib, df
 from pyscf.ao2mo import _ao2mo
+from pyscf.cc import ccsd
 
 from pyscf.sylvester_cc import mpcc_tools
 
-class ERIs:
 
-    def __init__(self, mf, mo_coeff=None):
+class _OrbitalSpace:
+    """Minimal object accepted by the restricted CCSD frozen-MO helpers."""
+
+    def __init__(self, mo_occ, frozen):
+        self.mo_occ = mo_occ
+        self.frozen = frozen
+        self._nocc = None
+        self._nmo = None
+
+
+class ERIs:
+    """Density-fitted MO integrals with CCSD-compatible frozen orbitals.
+
+    ``frozen`` accepts ``None``, an integer number of lowest orbitals, or an
+    explicit sequence of MO indices, matching :class:`pyscf.cc.ccsd.CCSD`.
+    """
+
+    def __init__(self, mf, mo_coeff=None, frozen=None, mo_occ=None):
 
         if getattr(mf, "with_df", None):
             self.with_df = mf.with_df
@@ -15,19 +32,82 @@ class ERIs:
             self.with_df.auxbasis = df.make_auxbasis(mf.mol, mp2fit=True)
 
         self.nao = mf.mol.nao
-        self.nocc = mf.mol.nelec[0]
-        self.nvir = mf.mol.nao - self.nocc
         self.naux = self.with_df.get_naoaux()
         if mo_coeff is None:
-           self.mo_coeff = mf.mo_coeff
-        else:
-           self.mo_coeff = mo_coeff       
-        self.mo_energy = mf.mo_energy
+            mo_coeff = mf.mo_coeff
+        if mo_occ is None:
+            mo_occ = mf.mo_occ
 
-        fock_mo = self.mo_coeff.T @ mf.get_fock() @ self.mo_coeff
+        full_mo_coeff = np.asarray(mo_coeff)
+        full_mo_occ = np.asarray(mo_occ)
+        if full_mo_coeff.ndim != 2:
+            raise ValueError("mo_coeff must be a two-dimensional array")
+        if full_mo_coeff.shape[0] != self.nao:
+            raise ValueError(
+                "mo_coeff AO dimension does not match the molecule: "
+                f"{full_mo_coeff.shape[0]} != {self.nao}"
+            )
+        if full_mo_occ.ndim != 1 or (
+            full_mo_occ.size != full_mo_coeff.shape[1]
+        ):
+            raise ValueError(
+                "mo_occ must be one-dimensional with one entry per MO"
+            )
+        if isinstance(frozen, (int, np.integer)) and frozen < 0:
+            raise ValueError("frozen must be nonnegative")
+
+        orbital_space = _OrbitalSpace(full_mo_occ, frozen)
+        try:
+            frozen_mask = ccsd.get_frozen_mask(orbital_space)
+            nocc = ccsd.get_nocc(orbital_space)
+            nmo = ccsd.get_nmo(orbital_space)
+        except (AssertionError, IndexError) as error:
+            raise ValueError(
+                "invalid frozen orbital specification for the supplied MOs"
+            ) from error
+
+        active_mo_occ = full_mo_occ[frozen_mask]
+        counted_nocc = int(np.count_nonzero(active_mo_occ > 0))
+        if nmo != int(np.count_nonzero(frozen_mask)) or nocc != counted_nocc:
+            raise ValueError("frozen orbital mask is inconsistent")
+        if nocc < 1:
+            raise ValueError("frozen specification removes all occupied MOs")
+        if nmo <= nocc:
+            raise ValueError("frozen specification removes all virtual MOs")
+        if (
+            np.any(active_mo_occ[:nocc] <= 0)
+            or np.any(active_mo_occ[nocc:] > 0)
+        ):
+            raise ValueError(
+                "restricted occupied and virtual MOs must be ordered"
+            )
+
+        self.frozen = frozen
+        self.frozen_mask = np.asarray(frozen_mask, dtype=bool)
+        self.active_orbital_indices = np.flatnonzero(self.frozen_mask)
+        self.full_mo_coeff = full_mo_coeff
+        self.full_mo_occ = full_mo_occ
+        self.mo_coeff = np.asarray(
+            full_mo_coeff[:, self.frozen_mask], order="F"
+        )
+        self.mo_occ = active_mo_occ
+        self.nmo = nmo
+        self.nocc = nocc
+        self.nvir = nmo - nocc
+
+        full_mo_energy = np.asarray(mf.mo_energy)
+        if full_mo_energy.ndim != 1 or (
+            full_mo_energy.size != full_mo_coeff.shape[1]
+        ):
+            raise ValueError(
+                "mf.mo_energy must contain one value per supplied MO"
+            )
+        self.mo_energy = full_mo_energy[self.frozen_mask]
+
+        fock_mo = self.mo_coeff.conj().T @ mf.get_fock() @ self.mo_coeff
         self.foo = fock_mo[: self.nocc, : self.nocc]
-        self.fvv = fock_mo[self.nocc : self.nao, self.nocc : self.nao]
-        self.fov = fock_mo[: self.nocc, self.nocc : self.nao]
+        self.fvv = fock_mo[self.nocc :, self.nocc :]
+        self.fov = fock_mo[: self.nocc, self.nocc :]
 
         # NOTE change convetion to virtual, occupied 
         self.eia = lib.direct_sum(
@@ -37,6 +117,10 @@ class ERIs:
         # NOTE Shall we keep this call here?
         self._make_df_eris()
         self._make_df_denominator()
+
+    def get_frozen_mask(self):
+        """Return the CCSD-style mask of retained orbitals."""
+        return self.frozen_mask.copy()
 
     def _make_df_denominator(self):
 
@@ -52,13 +136,13 @@ class ERIs:
         Lov = np.empty((self.naux, self.nocc, self.nvir))
         Lvv = np.empty((self.naux, self.nvir, self.nvir))
         mo = np.asarray(self.mo_coeff, order='F')
-        ijslice = (0, self.nao, 0, self.nao)
+        ijslice = (0, self.nmo, 0, self.nmo)
         p1 = 0
         Lpq = None
         for k, eri1 in enumerate(self.with_df.loop()):
             Lpq = _ao2mo.nr_e2(eri1, mo, ijslice, aosym='s2', mosym='s1', out=Lpq)
             p0, p1 = p1, p1 + Lpq.shape[0]
-            Lpq = Lpq.reshape(p1 - p0, self.nao, self.nao)
+            Lpq = Lpq.reshape(p1 - p0, self.nmo, self.nmo)
             Loo[p0:p1] = Lpq[:, :self.nocc, :self.nocc]
             Lov[p0:p1] = Lpq[:, :self.nocc, self.nocc:]
             Lvv[p0:p1] = Lpq[:, self.nocc:, self.nocc:]
@@ -68,89 +152,3 @@ class ERIs:
         self.Lov = Lov
         self.Lvo = Lvo
         self.Lvv = Lvv       
-
-        # NOTE 06/04 debate about cache 
-
-    # hold all a-a, a-i, i-i tensor segments here 
-    # compute Lvv on the fly *lazy?
-
-    # NOTE Remove after discussion on 06/11
-    # NOTE move contractions into the "class"
-    # NOTE Now comes the second set of equations
-    def get_Aia(self, u):
-
-        tmp_eri = np.einsum("Lkc,Lad->kcad", self.Lov, self.Lvv)
-
-        return np.einsum("kicd, kcad -> ia", u, tmp_eri)
-
-    def get_Bia(self, u):
-
-        tmp_eri = np.einsum("Lki,Llc->kilc", self.Loo, self.Lov)
-
-        return np.einsum("klac, -kilc -> ia", u, tmp_eri)
-
-    def get_Cia(self, u):
-
-        return np.einsum("ikac, kc-> ia", u, self.fov)
-
-    def get_Aijab(self, t):
-
-        tmp_eri = np.einsum("Lac, Lbd->acbd", self.Lvv, self.Lvv)
-
-        return np.einsum("ijcd, acbd -> ijab", t, tmp_eri)
-
-    def get_Bijab(self, t):
-
-        tmp_eri = np.einsum("Lkc, Lld -> kcld", self.self.Lov, self.self.Lov)
-        B = np.einsum("ijcd, kcld -> ijkl", t, tmp_eri)
-        tmp_eri = np.einsum("Lki, Ljl -> ijkl", self.Loo, self.Loo)
-        B = tmp_eri + B
-
-        return np.einsum("klab, ijkl -> ijab", t, B)
-
-    def get_Cijab(self, t):
-
-        # NOTE tmp_eri is the same as in get_Bijab
-        tmp_eri = np.einsum("Lkc, Lld -> kcld", self.Lov, self.Lov)
-        C = np.einsum("liad, kcld -> kiac", t, tmp_eri)
-        tmp_eri = np.einsum("Lki, Lac -> kiac", self.Loo, self.Lvv)
-        C = tmp_eri - 0.5 * C
-
-        return np.einsum("kjbc, kiac -> ijab", t, C)
-
-    def get_Dijab(self, t):
-
-        L = self.make_L()
-        u = make_u(t)
-        B = L + 0.5 * np.eisum("ilad, dclk -> icak", u, L)
-
-        return 0.5 * np.einsum("jkbc, icak -> ijab", u, B)
-
-    def get_Eijab(self, t):
-
-        u = make_u(t)
-        tmp_eri = np.einsum("Lld, Lkc -> ldkc", self.Lov, self.Lov)
-        E = self.fvv - np.einsum("klbd, ldkc -> bc", u, tmp_eri)
-
-        return np.einsum("ijac, bc -> ijab", t, E)
-
-    def get_Gijab(self, t):
-
-        u = make_u(t)
-        tmp_eri = np.einsum("Lkd, Llc -> kdlc", self.Lov, self.Lov)
-        G = self.foo + np.einsum("ljcd, kdlc -> jk", u, tmp_eri)
-
-        return np.einsum("-ikab, jk -> ijab", t, G)
-
-    def make_u(t):
-
-        return 2 * t - np.transpose(t, (0, 1, 3, 2))
-
-    def make_L(self):
-
-        tmp_eri1 = np.einsum("Lpr ,Lqs -> rspq", self.fov, self.fov)
-        tmp_eri2 = np.einsum("Lps ,Lqr -> rspq", self.fov, self.fov)
-
-        return 2 * tmp_eri1 - tmp_eri2
-
-    #####

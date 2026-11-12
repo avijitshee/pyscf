@@ -203,6 +203,16 @@ class DFRPA:
         Fvv -= lib.einsum("Lmb,Lam->ab", self._eris.Lov, Xvo_t2)
         return Foo, Fvv
 
+
+    def get_Y2(self, t2, Joo, Jvv):
+
+        tmp = lib.einsum("Lbc,ijac->Lijab", Jvv, t2)
+        tmp -= lib.einsum("Lmi,mjab->Lijab", Joo, t2)
+
+        Y2 += tmp + tmp.transpose(0, 2, 1, 4, 3)
+
+        return Y2
+
     def get_Ω(self, X, Xvo, Xvo_t2, Foo, Fvv, Fov, t1, t2):
         Foo_tmp = Foo.copy()
         Fvv_tmp = Fvv.copy()
@@ -287,6 +297,21 @@ class DFRPA:
         tmp -= self.ladder_contraction(t2, Joo, Jvv)
         res2 += tmp + tmp.transpose(1, 0, 3, 2)
         return res2
+
+    def update_t3(self, t2, Jvo, Foo, Fvv, Fov, t1, Joo, Jvv):
+        res2 = lib.einsum("Lai,Lbj->ijab", Jvo, Jvo)
+
+        Foo_tmp = Foo.copy()
+        Fvv_tmp = Fvv.copy()
+        Foo_tmp += lib.einsum("ic,jc->ij", Fov, t1)
+        Fvv_tmp -= lib.einsum("lb,la->ab", Fov, t1)
+
+        tmp = lib.einsum("bc,ijac->ijab", Fvv_tmp, t2)
+        tmp -= lib.einsum("mi,mjab->ijab", Foo_tmp, t2)
+        tmp -= self.ladder_contraction(t2, Joo, Jvv)
+        res2 += tmp + tmp.transpose(1, 0, 3, 2)
+        return res2
+
 
     def init_amps(self):
         t2 = lib.einsum("Lai,Lbj->ijab", self._eris.Lvo, self._eris.Lvo)

@@ -55,6 +55,7 @@ class DFRPA:
 
         self.diis = True
         self._eris = eris
+        self.frozen = getattr(eris, "frozen", None)
         self._e_corr = None
         self._e_ladder_pert = 0.0
         self.converged = False
@@ -70,11 +71,19 @@ class DFRPA:
 
     @property
     def nvir(self):
-        return self.mf.mol.nao - self.nocc
+        return self._eris.Lvv.shape[1]
 
     @property
     def nocc(self):
-        return self.mf.mol.nelec[0]
+        return self._eris.Loo.shape[1]
+
+    @property
+    def nmo(self):
+        return self.nocc + self.nvir
+
+    def get_frozen_mask(self):
+        """Return the CCSD-style mask of orbitals retained in the solver."""
+        return self._eris.get_frozen_mask()
 
     @property
     def active_ladder_report(self):

@@ -6,13 +6,18 @@ The doubles amplitudes are represented during the iteration as
 
 where the compound rank index ``R`` consists of the density-fitting and
 Laplace-quadrature indices.  The persistent iterative state remains
-factorized.  By default, a dense doubles tensor is reconstructed transiently
-for the otherwise expensive exchange part of ``Xvo_t2`` and released after
-that contraction; the returned doubles tensor is reconstructed after the
-iteration.
+factorized.  A dense doubles tensor is reconstructed transiently for the
+faster direct and exchange contractions in ``Xvo_t2`` and released afterward.
+The returned doubles tensor is reconstructed after the iteration.
+
+Passing ``ladder_mode="perturbative"`` leaves the Sylvester iterations
+ladder-free and adds the full ladder energy correction after convergence.  Its
+ladder residual is assembled from the stored factors without applying the
+dense ladder operator to ``t2``.
 """
 
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import scipy.special
@@ -23,11 +28,33 @@ from pyscf.lib import logger
 from pyscf.sylvester_cc import dfrpa, laplace_quadrature
 
 
+class _IterationIntermediates(NamedTuple):
+    """Arrays shared by the singles and doubles solves in one iteration."""
+
+    X: np.ndarray
+    Xoo: np.ndarray
+    Xvo: np.ndarray
+    Xvo_t2: np.ndarray
+    Foo: np.ndarray
+    Fvv: np.ndarray
+    Fov: np.ndarray
+    Fov_t1_oo: np.ndarray
+    Fov_t1_vv: np.ndarray
+
+
 class DFRPASylvester(dfrpa.DFRPA):
-    """Canonical-RHF DFRPA solved with factorized Sylvester equations."""
+    """Canonical-RHF DFRPA with optional perturbative ladder energy."""
 
     def __init__(self, mf, eris, **kwargs):
+        # The Sylvester model continues to use the historical ladder-free
+        # DFRPA equations unless a ladder mode is explicitly requested.
+        kwargs.setdefault("ladder_mode", None)
         super().__init__(mf, eris, **kwargs)
+        if self.ladder_mode not in (None, "perturbative"):
+            raise ValueError(
+                "DFRPASylvester supports ladder_mode=None or "
+                "ladder_mode='perturbative'"
+            )
 
         self.verbose = getattr(mf, "verbose", logger.NOTE)
         self.stdout = getattr(mf, "stdout", None)
@@ -45,24 +72,6 @@ class DFRPASylvester(dfrpa.DFRPA):
             kwargs.get("ll_chebyshev_max_degree", 300)
         )
         self.ll_canonical_tol = float(kwargs.get("ll_canonical_tol", 1.0e-8))
-        self.ll_xvo_t2_mode = kwargs.get("ll_xvo_t2_mode", "dense").lower()
-        exchange_tol = kwargs.get("ll_exchange_screen_tol", 0.0)
-        self.ll_exchange_screen_tol = 0.0 if exchange_tol is None else float(exchange_tol)
-        self.ll_exchange_screen_mode = kwargs.get(
-            "ll_exchange_screen_mode", "calibrated"
-        ).lower()
-        self.ll_exchange_q_block_size = int(
-            kwargs.get("ll_exchange_q_block_size", 128)
-        )
-        self.ll_exchange_rank_block_size = int(
-            kwargs.get("ll_exchange_rank_block_size", 512)
-        )
-        self.ll_exchange_check_interval = int(
-            kwargs.get("ll_exchange_check_interval", 4)
-        )
-        self.ll_exchange_screen_refresh = int(
-            kwargs.get("ll_exchange_screen_refresh", 4)
-        )
 
         if self.diis_space < 1:
             raise ValueError("diis_space must be positive")
@@ -70,57 +79,25 @@ class DFRPASylvester(dfrpa.DFRPA):
             raise ValueError("ll_laplace_npoints must be positive")
         if not 0.0 <= self.ll_laplace_interval_margin < 1.0:
             raise ValueError("ll_laplace_interval_margin must be in [0, 1)")
-        if self.ll_exchange_screen_tol < 0.0:
-            raise ValueError("ll_exchange_screen_tol must be nonnegative")
-        if self.ll_xvo_t2_mode not in ("dense", "factorized"):
-            raise ValueError("ll_xvo_t2_mode must be 'dense' or 'factorized'")
-        if self.ll_exchange_screen_mode not in ("bound", "calibrated"):
-            raise ValueError(
-                "ll_exchange_screen_mode must be 'bound' or 'calibrated'"
-            )
-        if self.ll_exchange_q_block_size < 1:
-            raise ValueError("ll_exchange_q_block_size must be positive")
-        if self.ll_exchange_rank_block_size < 1:
-            raise ValueError("ll_exchange_rank_block_size must be positive")
-        if self.ll_exchange_check_interval < 1:
-            raise ValueError("ll_exchange_check_interval must be positive")
-        if self.ll_exchange_screen_refresh < 0:
-            raise ValueError("ll_exchange_screen_refresh must be nonnegative")
 
-        self._validate_canonical_orbitals()
         self._quadrature_t1 = None
         self._quadrature_t2 = None
         self._Y = None
         self._e_tot = None
-        self._exchange_screen_history = []
-        self._exchange_screen_selection = None
-        self._exchange_screen_calls = 0
+        self._xvo_t2_timing = None
+        self._xvo_t2_timing_history = []
         self.converged = False
 
     @property
     def e_corr(self):
         return self._e_corr
 
-    def _validate_canonical_orbitals(self):
-        """Reject occupied/virtual rotations of the canonical RHF orbitals."""
-        foo_offdiag = self._eris.foo - np.diag(np.diag(self._eris.foo))
-        fvv_offdiag = self._eris.fvv - np.diag(np.diag(self._eris.fvv))
-        scale = max(
-            1.0,
-            float(np.linalg.norm(self._eris.foo)),
-            float(np.linalg.norm(self._eris.fvv)),
-        )
-        error = max(
-            float(np.linalg.norm(foo_offdiag)),
-            float(np.linalg.norm(fvv_offdiag)),
-            float(np.linalg.norm(self._eris.fov)),
-        )
-        if error > self.ll_canonical_tol * scale:
-            raise ValueError(
-                "DFRPASylvester requires canonical RHF orbitals; the MO Fock "
-                f"matrix is not diagonal (relative off-diagonal norm "
-                f"{error / scale:.3e})."
-            )
+    @property
+    def xvo_t2_timing(self):
+        """Timing breakdown for the most recent nonzero ``Xvo_t2`` build."""
+        if self._xvo_t2_timing is None:
+            return None
+        return dict(self._xvo_t2_timing)
 
     def kernel(self, t1=None, t2=None):
         """Solve the coupled equations and return dense ``(t1, t2)``."""
@@ -153,8 +130,16 @@ class DFRPASylvester(dfrpa.DFRPA):
 
         self.converged = False
         for iteration in range(1, self.ll_max_its + 1):
-            Y_target = self.solve_doubles(t1, Y, quad_t2)
-            t1_target = self.solve_singles(t1, Y_target, quad_t1)
+            # Use a simultaneous fixed-point update: both equations are
+            # evaluated at the same current (t1, Y), so every common
+            # intermediate, including Xvo_t2, is constructed only once.
+            intermediates = self.get_iteration_intermediates(t1, Y)
+            Y_target = self.solve_doubles(
+                t1, Y, quad_t2, intermediates=intermediates
+            )
+            t1_target = self.solve_singles(
+                t1, Y, quad_t1, intermediates=intermediates
+            )
 
             delta_t1 = t1_target - t1
             delta_Y = Y_target - Y
@@ -296,397 +281,84 @@ class DFRPASylvester(dfrpa.DFRPA):
                 f"gaps [{interval[0]:.6e}, {interval[1]:.6e}]"
             )
 
-    def get_X_factorized(self, t1, Y):
+    def get_X_t1(self, t1):
+        """Build the X intermediates that are independent of doubles."""
         Xvo = lib.einsum("Lab,ib->Lai", self._eris.Lvv, t1)
-        Xvo_t2 = self.get_Xvo_t2(Y)
         Xoo = lib.einsum("Lia,ja->Lij", self._eris.Lov, t1)
         X = 2.0 * lib.einsum("Lia,ia->L", self._eris.Lov, t1)
+        return X, Xoo, Xvo
+
+    def get_iteration_intermediates(self, t1, Y):
+        """Build all arrays shared by the two simultaneous amplitude solves."""
+        X, Xoo, Xvo = self.get_X_t1(t1)
+        Xvo_t2 = self.get_Xvo_t2(Y)
+        Foo, Fvv, Fov = self.get_F(t1, X, Xoo, Xvo)
+        Foo, Fvv = self.add_t2_to_fock(Fvv, Foo, Xvo_t2)
+        Fov_t1_oo = lib.einsum("ic,jc->ij", Fov, t1)
+        Fov_t1_vv = lib.einsum("lb,la->ab", Fov, t1)
+        return _IterationIntermediates(
+            X,
+            Xoo,
+            Xvo,
+            Xvo_t2,
+            Foo,
+            Fvv,
+            Fov,
+            Fov_t1_oo,
+            Fov_t1_vv,
+        )
+
+    def get_X_factorized(self, t1, Y):
+        X, Xoo, Xvo = self.get_X_t1(t1)
+        Xvo_t2 = self.get_Xvo_t2(Y)
         return X, Xoo, Xvo, Xvo_t2
 
     def get_Xvo_t2(self, Y):
-        """Evaluate ``Lov * (2*t2 - t2.swapaxes(2,3))`` from factors."""
+        """Evaluate ``Lov * (2*t2 - t2.swapaxes(2,3))`` through dense ``t2``."""
         Y_flat = self._flatten_factors(Y)
         if not np.any(Y_flat):
-            result = np.zeros_like(self._eris.Lvo)
-            self._record_exchange_screen_stats(
-                {
-                    "zero_factors": True,
-                    "total_blocks": 0,
-                    "evaluated_blocks": 0,
-                    "skipped_blocks": 0,
-                    "screen_tolerance": self.ll_exchange_screen_tol,
-                    "converged": True,
-                    "exchange_norm": 0.0,
-                    "remaining_bound": 0.0,
-                    "relative_error_bound": 0.0,
-                    "convergence": (),
-                }
-            )
-            return result
-
-        if self.ll_xvo_t2_mode == "dense":
-            return self.get_Xvo_t2_dense(Y_flat)
-
-        overlap = lib.einsum("Lkc,Rck->LR", self._eris.Lov, Y_flat)
-        Xvo_t2 = -2.0 * lib.einsum("LR,Rai->Lai", overlap, Y_flat)
-        Xvo_t2 += self.get_Xvo_t2_exchange(Y_flat)
-        return Xvo_t2
+            return np.zeros_like(self._eris.Lvo)
+        return self.get_Xvo_t2_dense(Y_flat)
 
     def get_Xvo_t2_dense(self, Y):
-        """Reconstruct transient ``t2`` and contract ``Xvo_t2`` densely."""
-        t2 = self.reconstruct_t2(Y)
+        """Reconstruct transient ``t2`` and time its direct/exchange actions."""
+        Y_flat = self._flatten_factors(Y)
+        total_start = logger.perf_counter()
+
+        reconstruction_start = logger.perf_counter()
+        t2 = self.reconstruct_t2(Y_flat)
+        reconstruction_time = logger.perf_counter() - reconstruction_start
+
+        direct_start = logger.perf_counter()
         Xvo_t2 = 2.0 * lib.einsum("Lkc,ikac->Lai", self._eris.Lov, t2)
+        direct_time = logger.perf_counter() - direct_start
+
+        exchange_start = logger.perf_counter()
         exchange = lib.einsum("Lkc,ikca->Lai", self._eris.Lov, t2)
         Xvo_t2 -= exchange
-        self._record_exchange_screen_stats(
-            {
-                "mode": "dense",
-                "zero_factors": False,
-                "total_blocks": 1,
-                "evaluated_blocks": 1,
-                "skipped_blocks": 0,
-                "screen_tolerance": 0.0,
-                "converged": True,
-                "exchange_norm": float(np.linalg.norm(exchange)),
-                "remaining_bound": 0.0,
-                "relative_error_bound": 0.0,
-                "dense_t2_bytes": t2.nbytes,
-                "convergence": (),
-            }
+        exchange_time = logger.perf_counter() - exchange_start
+
+        timing = {
+            "direct": direct_time,
+            "reconstruct_t2": reconstruction_time,
+            "exchange": exchange_time,
+            "total": logger.perf_counter() - total_start,
+            "dense_t2_bytes": t2.nbytes,
+        }
+        self._xvo_t2_timing = timing
+        if not hasattr(self, "_xvo_t2_timing_history"):
+            self._xvo_t2_timing_history = []
+        self._xvo_t2_timing_history.append(timing)
+        logger.debug(
+            self,
+            "DFRPASylvester Xvo_t2 wall time: direct %.6f s; reconstruct "
+            "%.6f s; exchange %.6f s; total %.6f s",
+            timing["direct"],
+            timing["reconstruct_t2"],
+            timing["exchange"],
+            timing["total"],
         )
         return Xvo_t2
-
-    def get_Xvo_t2_exchange(self, Y):
-        """Build the exchange part of ``Xvo_t2`` in dominant-first blocks.
-
-        Each candidate block has the rigorous Frobenius upper bound
-
-        ``||L_Q||_F * sum_R ||Y_R||_F**2``.
-
-        Blocks are evaluated from largest to smallest bound.  If
-        ``ll_exchange_screen_tol`` is positive, the evaluation stops when the
-        bound on all omitted blocks guarantees the requested relative error
-        in the accumulated exchange tensor.  A zero tolerance evaluates all
-        blocks and is therefore exact up to contraction ordering.
-        """
-        Y_flat = self._flatten_factors(Y)
-        Lov = self._eris.Lov
-        naux = Lov.shape[0]
-        nrank = Y_flat.shape[0]
-        qsize = self.ll_exchange_q_block_size
-        rsize = self.ll_exchange_rank_block_size
-
-        q_ranges = [
-            (start, min(start + qsize, naux))
-            for start in range(0, naux, qsize)
-        ]
-        r_ranges = [
-            (start, min(start + rsize, nrank))
-            for start in range(0, nrank, rsize)
-        ]
-        if (
-            self.ll_exchange_screen_tol > 0.0
-            and self.ll_exchange_screen_mode == "calibrated"
-        ):
-            return self._get_Xvo_t2_exchange_calibrated(
-                Y_flat, q_ranges, r_ranges
-            )
-
-        lnorm = np.asarray(
-            [np.linalg.norm(Lov[q0:q1]) for q0, q1 in q_ranges]
-        )
-        ynorm2 = np.asarray(
-            [lib.einsum("Rai,Rai->", Y_flat[r0:r1], Y_flat[r0:r1])
-             for r0, r1 in r_ranges]
-        )
-
-        candidates = [
-            (float(lnorm[qindex] * ynorm2[rindex]), qindex, rindex)
-            for qindex in range(len(q_ranges))
-            for rindex in range(len(r_ranges))
-        ]
-        candidates.sort(key=lambda item: item[0], reverse=True)
-
-        remaining_by_q = lnorm * float(np.sum(ynorm2))
-        exchange = np.zeros(
-            (naux, Y_flat.shape[1], Y_flat.shape[2]),
-            dtype=np.result_type(Lov, Y_flat),
-        )
-        tolerance = self.ll_exchange_screen_tol
-        convergence = []
-        evaluated = 0
-        converged = tolerance == 0.0 and not candidates
-
-        for bound, qindex, rindex in candidates:
-            q0, q1 = q_ranges[qindex]
-            r0, r1 = r_ranges[rindex]
-            Y_block = Y_flat[r0:r1]
-            intermediate = lib.einsum(
-                "Qkc,Rci->QRki", Lov[q0:q1], Y_block
-            )
-            exchange[q0:q1] += lib.einsum(
-                "QRki,Rak->Qai", intermediate, Y_block
-            )
-            evaluated += 1
-            remaining_by_q[qindex] = max(
-                0.0, remaining_by_q[qindex] - bound
-            )
-
-            should_check = (
-                tolerance > 0.0
-                and (
-                    evaluated % self.ll_exchange_check_interval == 0
-                    or evaluated == len(candidates)
-                )
-            )
-            if should_check:
-                exchange_norm = float(np.linalg.norm(exchange))
-                remaining_bound = float(np.linalg.norm(remaining_by_q))
-                relative_bound = self._relative_remainder_bound(
-                    exchange_norm, remaining_bound
-                )
-                convergence.append(
-                    {
-                        "evaluated_blocks": evaluated,
-                        "exchange_norm": exchange_norm,
-                        "remaining_bound": remaining_bound,
-                        "relative_error_bound": relative_bound,
-                    }
-                )
-                if relative_bound <= tolerance:
-                    converged = True
-                    break
-
-        exchange_norm = float(np.linalg.norm(exchange))
-        remaining_bound = float(np.linalg.norm(remaining_by_q))
-        relative_bound = self._relative_remainder_bound(
-            exchange_norm, remaining_bound
-        )
-        if tolerance == 0.0:
-            converged = evaluated == len(candidates)
-
-        stats = {
-            "mode": "bound",
-            "zero_factors": False,
-            "total_blocks": len(candidates),
-            "evaluated_blocks": evaluated,
-            "skipped_blocks": len(candidates) - evaluated,
-            "screen_tolerance": tolerance,
-            "converged": converged,
-            "exchange_norm": exchange_norm,
-            "remaining_bound": remaining_bound,
-            "relative_error_bound": relative_bound,
-            "largest_block_bound": candidates[0][0] if candidates else 0.0,
-            "smallest_evaluated_bound": (
-                candidates[evaluated - 1][0] if evaluated else 0.0
-            ),
-            "q_block_size": qsize,
-            "rank_block_size": rsize,
-            "convergence": tuple(convergence),
-        }
-        self._record_exchange_screen_stats(stats)
-        logger.debug(
-            self,
-            "DFRPASylvester exchange screening: evaluated %d/%d blocks; "
-            "relative error bound %.3e (target %.3e)",
-            evaluated,
-            len(candidates),
-            relative_bound,
-            tolerance,
-        )
-        return exchange
-
-    def _get_Xvo_t2_exchange_calibrated(self, Y_flat, q_ranges, r_ranges):
-        """Select dominant exchange blocks from a measured convergence curve.
-
-        A calibration build evaluates every block, sorts the actual block
-        norms, and retains the shortest checked prefix whose exchange tensor
-        differs from the complete build by no more than the configured
-        relative tolerance.  The selected list is reused between calibration
-        builds.  This mode is empirical between refreshes; use ``mode='bound'``
-        when a rigorous per-call omitted-block bound is required.
-        """
-        self._exchange_screen_calls += 1
-        refresh = self.ll_exchange_screen_refresh
-        selection_key = (
-            self._eris.Lov.shape,
-            Y_flat.shape,
-            self.ll_exchange_q_block_size,
-            self.ll_exchange_rank_block_size,
-            self.ll_exchange_screen_tol,
-        )
-        cached = self._exchange_screen_selection
-        needs_calibration = (
-            cached is None
-            or cached["key"] != selection_key
-            or (
-                refresh > 0
-                and self._exchange_screen_calls - cached["call"] >= refresh
-            )
-        )
-
-        if not needs_calibration:
-            exchange = np.zeros(
-                (self._eris.Lov.shape[0], Y_flat.shape[1], Y_flat.shape[2]),
-                dtype=np.result_type(self._eris.Lov, Y_flat),
-            )
-            for qindex, rindex in cached["blocks"]:
-                self._accumulate_exchange_block(
-                    exchange, Y_flat, q_ranges, r_ranges, qindex, rindex
-                )
-            stats = {
-                "mode": "calibrated",
-                "calibration_build": False,
-                "zero_factors": False,
-                "total_blocks": len(q_ranges) * len(r_ranges),
-                "evaluated_blocks": len(cached["blocks"]),
-                "retained_blocks": len(cached["blocks"]),
-                "skipped_blocks": (
-                    len(q_ranges) * len(r_ranges) - len(cached["blocks"])
-                ),
-                "screen_tolerance": self.ll_exchange_screen_tol,
-                "converged": True,
-                "exchange_norm": float(np.linalg.norm(exchange)),
-                "remaining_bound": np.nan,
-                "relative_error_bound": np.nan,
-                "calibration_relative_error": cached["relative_error"],
-                "q_block_size": self.ll_exchange_q_block_size,
-                "rank_block_size": self.ll_exchange_rank_block_size,
-                "convergence": cached["convergence"],
-            }
-            self._record_exchange_screen_stats(stats)
-            return exchange
-
-        full = np.zeros(
-            (self._eris.Lov.shape[0], Y_flat.shape[1], Y_flat.shape[2]),
-            dtype=np.result_type(self._eris.Lov, Y_flat),
-        )
-        contributions = []
-        for qindex in range(len(q_ranges)):
-            q0, q1 = q_ranges[qindex]
-            for rindex in range(len(r_ranges)):
-                contribution = self._exchange_block(
-                    Y_flat, q_ranges, r_ranges, qindex, rindex
-                )
-                full[q0:q1] += contribution
-                contributions.append(
-                    (
-                        float(np.linalg.norm(contribution)),
-                        qindex,
-                        rindex,
-                        contribution,
-                    )
-                )
-
-        contributions.sort(key=lambda item: item[0], reverse=True)
-        full_norm = float(np.linalg.norm(full))
-        partial = np.zeros_like(full)
-        selected = []
-        convergence = []
-        relative_error = np.inf
-        for index, (_, qindex, rindex, contribution) in enumerate(
-            contributions, 1
-        ):
-            q0, q1 = q_ranges[qindex]
-            partial[q0:q1] += contribution
-            selected.append((qindex, rindex))
-            should_check = (
-                index % self.ll_exchange_check_interval == 0
-                or index == len(contributions)
-            )
-            if should_check:
-                omitted_norm = float(np.linalg.norm(full - partial))
-                if full_norm == 0.0:
-                    relative_error = 0.0 if omitted_norm == 0.0 else np.inf
-                else:
-                    relative_error = omitted_norm / full_norm
-                convergence.append(
-                    {
-                        "evaluated_blocks": index,
-                        "exchange_norm": float(np.linalg.norm(partial)),
-                        "relative_error": relative_error,
-                    }
-                )
-                if relative_error <= self.ll_exchange_screen_tol:
-                    break
-
-        cached = {
-            "key": selection_key,
-            "call": self._exchange_screen_calls,
-            "blocks": tuple(selected),
-            "relative_error": relative_error,
-            "convergence": tuple(convergence),
-        }
-        self._exchange_screen_selection = cached
-        total_blocks = len(contributions)
-        stats = {
-            "mode": "calibrated",
-            "calibration_build": True,
-            "zero_factors": False,
-            "total_blocks": total_blocks,
-            # Calibration computes every block once even if fewer are retained.
-            "evaluated_blocks": total_blocks,
-            "retained_blocks": len(selected),
-            "skipped_blocks": total_blocks - len(selected),
-            "screen_tolerance": self.ll_exchange_screen_tol,
-            "converged": relative_error <= self.ll_exchange_screen_tol,
-            "exchange_norm": float(np.linalg.norm(partial)),
-            "complete_exchange_norm": full_norm,
-            "remaining_bound": np.nan,
-            "relative_error_bound": np.nan,
-            "calibration_relative_error": relative_error,
-            "largest_block_norm": contributions[0][0] if contributions else 0.0,
-            "smallest_retained_block_norm": (
-                contributions[len(selected) - 1][0] if selected else 0.0
-            ),
-            "q_block_size": self.ll_exchange_q_block_size,
-            "rank_block_size": self.ll_exchange_rank_block_size,
-            "convergence": tuple(convergence),
-        }
-        self._record_exchange_screen_stats(stats)
-        logger.debug(
-            self,
-            "DFRPASylvester calibrated exchange screening: retained %d/%d "
-            "blocks; measured relative error %.3e (target %.3e)",
-            len(selected),
-            total_blocks,
-            relative_error,
-            self.ll_exchange_screen_tol,
-        )
-        return partial
-
-    def _exchange_block(self, Y_flat, q_ranges, r_ranges, qindex, rindex):
-        q0, q1 = q_ranges[qindex]
-        r0, r1 = r_ranges[rindex]
-        Y_block = Y_flat[r0:r1]
-        intermediate = lib.einsum(
-            "Qkc,Rci->QRki", self._eris.Lov[q0:q1], Y_block
-        )
-        return lib.einsum("QRki,Rak->Qai", intermediate, Y_block)
-
-    def _accumulate_exchange_block(
-        self, exchange, Y_flat, q_ranges, r_ranges, qindex, rindex
-    ):
-        q0, q1 = q_ranges[qindex]
-        exchange[q0:q1] += self._exchange_block(
-            Y_flat, q_ranges, r_ranges, qindex, rindex
-        )
-
-    @staticmethod
-    def _relative_remainder_bound(partial_norm, remaining_bound):
-        """Bound ``||omitted|| / ||complete||`` using a partial sum."""
-        complete_lower_bound = partial_norm - remaining_bound
-        if remaining_bound == 0.0:
-            return 0.0
-        if complete_lower_bound <= 0.0:
-            return np.inf
-        return remaining_bound / complete_lower_bound
-
-    def _record_exchange_screen_stats(self, stats):
-        if not hasattr(self, "_exchange_screen_history"):
-            self._exchange_screen_history = []
-        self._exchange_screen_history.append(stats)
-        self._exchange_screen_stats = stats
 
     def get_J_factorized(self, Xoo, Xvo, Xvo_t2, t1):
         Joo = Xoo + self._eris.Loo
@@ -698,14 +370,54 @@ class DFRPASylvester(dfrpa.DFRPA):
         )
         return Joo, Jvo
 
-    def solve_doubles(self, t1, Y, quad):
-        X, Xoo, Xvo, Xvo_t2 = self.get_X_factorized(t1, Y)
-        _, Jvo = self.get_J_factorized(Xoo, Xvo, Xvo_t2, t1)
-        Foo, Fvv, Fov = self.get_F(t1, X, Xoo, Xvo)
-        Foo, Fvv = self.add_t2_to_fock(Fvv, Foo, Xvo_t2)
+    def ladder_pert_energy(self, t2, Joo, Jvv):
+        """Evaluate the post-convergence ladder correction from ``Y``.
 
-        Foo_dressed = Foo + lib.einsum("ic,jc->ij", Fov, t1)
-        Fvv_dressed = Fvv - lib.einsum("lb,la->ab", Fov, t1)
+        The contraction order is
+
+        ``Joo,Jvv -> ovov; ovov,Y -> ovLR; ovLR,Y -> ladder_res``.
+
+        The final scalar contraction uses the supplied dense ``t2``, matching
+        :meth:`dfrpa.DFRPA.ladder_pert_energy` without constructing the dense
+        ladder action ``ovov * t2``.
+        """
+        if self._Y is None:
+            raise RuntimeError(
+                "factorized perturbative ladder energy requires converged Y "
+                "factors; call kernel() first"
+            )
+
+        Y = np.asarray(self._Y)
+        if Y.ndim != 4:
+            raise ValueError(
+                "stored Y factors must have shape "
+                "(naux,nlap,nvir,nocc)"
+            )
+
+        ovov = lib.einsum("Qmj,Qbe->mbje", Joo, Jvv)
+        ovLR = lib.einsum("mbje,LRem->bjLR", ovov, Y)
+        del ovov
+        tmp = lib.einsum("bjLR,LRai->ijab", ovLR, Y)
+        del ovLR
+        ladder_res = tmp + tmp.transpose(1, 0, 3, 2)
+
+        energy = 2.0 * lib.einsum("ijab,ijab", t2, ladder_res)
+        energy -= lib.einsum("ijab,ijba", t2, ladder_res)
+        return energy.real
+
+    def solve_doubles(self, t1, Y, quad, intermediates=None):
+        """Solve doubles, optionally reusing all iteration intermediates."""
+        if intermediates is None:
+            intermediates = self.get_iteration_intermediates(t1, Y)
+        _, Jvo = self.get_J_factorized(
+            intermediates.Xoo,
+            intermediates.Xvo,
+            intermediates.Xvo_t2,
+            t1,
+        )
+
+        Foo_dressed = intermediates.Foo + intermediates.Fov_t1_oo
+        Fvv_dressed = intermediates.Fvv - intermediates.Fov_t1_vv
         self._validate_dressed_gaps(Foo_dressed, Fvv_dressed, quad, 2, "doubles")
         return self.get_sylvester_laplace_matrix_factors(
             Jvo, Foo_dressed, Fvv_dressed, quad
@@ -731,14 +443,20 @@ class DFRPASylvester(dfrpa.DFRPA):
         result += lib.einsum("Rij,Raj->ai", exchange, Y_flat)
         return result
 
-    def solve_singles(self, t1, Y, quad):
-        X, Xoo, Xvo, Xvo_t2 = self.get_X_factorized(t1, Y)
-        Foo, Fvv, Fov = self.get_F(t1, X, Xoo, Xvo)
-        Foo, Fvv = self.add_t2_to_fock(Fvv, Foo, Xvo_t2)
+    def solve_singles(self, t1, Y, quad, intermediates=None):
+        """Solve singles, optionally reusing all iteration intermediates."""
+        if intermediates is None:
+            intermediates = self.get_iteration_intermediates(t1, Y)
 
-        Foo_dressed = Foo + 0.5 * lib.einsum("ic,jc->ij", Fov, t1)
-        Fvv_dressed = Fvv - 0.5 * lib.einsum("lb,la->ab", Fov, t1)
-        omega0 = self.get_omega0_factorized(X, Xvo, Xvo_t2, Fov, Y)
+        Foo_dressed = intermediates.Foo + 0.5 * intermediates.Fov_t1_oo
+        Fvv_dressed = intermediates.Fvv - 0.5 * intermediates.Fov_t1_vv
+        omega0 = self.get_omega0_factorized(
+            intermediates.X,
+            intermediates.Xvo,
+            intermediates.Xvo_t2,
+            intermediates.Fov,
+            Y,
+        )
         self._validate_dressed_gaps(Foo_dressed, Fvv_dressed, quad, 1, "singles")
         return self.solve_singles_laplace(
             omega0, Foo_dressed, Fvv_dressed, quad
